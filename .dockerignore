@@ -1,0 +1,9 @@
+.git/
+.claude/
+*.md
+*.log
+*.pyc
+__pycache__/
+config/config.yaml
+diagnose.py
+.env

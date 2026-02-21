@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  bluetti-mqtt:
+    image: bluetti_ac500_mqtt:v1
+    build: .
+    container_name: bluetti_ac500_mqtt
+    restart: unless-stopped
+
+    # Required for Bluetooth / D-Bus / USB hardware access
+    network_mode: host
+    privileged: true
+
+    volumes:
+      - /opt/bluetti/config:/config:ro   # config file — adjust path to your host
+      - /sys/class/bluetooth:/sys/class/bluetooth  # BT sysfs
+      - /dev/bus/usb:/dev/bus/usb                  # USB adapter passthrough

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+bluetti.log
+.env
+config/config.yaml
+.claude/

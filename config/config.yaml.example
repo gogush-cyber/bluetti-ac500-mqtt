@@ -1,0 +1,19 @@
+# ──────────────────────────────────────────────────────────────
+#  Bluetti AC500 → MQTT Bridge  –  Configuration
+#  Copy this file to config.yaml and fill in your own values.
+#  Mount this directory as /config inside the Docker container.
+# ──────────────────────────────────────────────────────────────
+
+ble:
+  address:  "AA:BB:CC:DD:EE:FF"   # BLE MAC of your AC500 (run --scan to find it)
+  interval: 30                    # Polling interval in seconds (min 10)
+
+mqtt:
+  broker:   "192.168.1.100"       # MQTT broker IP / hostname
+  port:     1883                  # MQTT broker port
+  username: ""                    # Leave empty if no auth
+  password: ""                    # Leave empty if no auth
+  topic:    "bluetti/ac500"       # Base MQTT topic
+
+logging:
+  level: "INFO"                   # DEBUG | INFO | WARNING | ERROR
