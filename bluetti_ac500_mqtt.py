@@ -1,18 +1,26 @@
 """
-Bluetti AC500 -> MQTT Bridge  (v3)
+Bluetti AC500 -> MQTT Bridge  (v5)
 ====================================
-v3 adds MQTT auto-discovery: the bridge self-registers all entities with
-Home Assistant via homeassistant/<domain>/<unique_id>/config topics.
-No manual yaml configuration in HA is needed.
+v5 adds full multi-pack B300 support and fixes per-pack HA discovery templates.
+
+v4 features retained:
+  - Optional dark web status dashboard (aiohttp, port 8273)
+  - Live sensor grid, control buttons, Chart.js history chart
+
+v5 new features:
+  - Per-pack polling via register 3006 selector (all 6 B300 slots)
+  - Pack voltage + SOC published individually (pack_1 … pack_6)
+  - Packs connected count derived from actual live data (not raw reg 96)
+  - Fixed HA MQTT discovery value_template for per-pack sensors
+
+v3 features retained:
+  - MQTT auto-discovery for all entities (sensors, switches, selects, numbers)
+  - Device grouping in HA (all entities under one "Bluetti AC500" device)
+  - Availability topic (online/offline with LWT)
 
 v2 features retained:
   - Bidirectional control via bluetti/ac500/set/<param>
   - 8 writable parameters (AC/DC output, grid charge, UPS mode, etc.)
-
-v3 new features:
-  - MQTT auto-discovery for all 19 entities (sensors, switches, selects, numbers)
-  - Device grouping in HA (all entities under one "Bluetti AC500" device)
-  - Availability topic (online/offline with LWT)
 
 Prerequisites
 -------------
@@ -121,23 +129,9 @@ AC500_REGISTERS = {
     80: ("ac_input_frequency",     0.01,  "Hz"),
     92: ("total_battery_voltage",  0.1,   "V"),
     96: ("pack_num",               1,     ""),    # number of connected B300 packs
-    # Per-pack data — 4-register blocks starting at 98, one block per pack.
-    # Layout per block: [pack_id, ?, voltage (×0.01 V), percent]
-    # All 6 packs fall within the existing battery_pack query range (91–127).
-    # ⚠ Offsets for packs 2–6 are inferred from the pack-1 pattern;
-    #   verify with diagnose.py against your hardware if values look wrong.
-     98: ("pack_1_voltage", 0.01, "V"),
-     99: ("pack_1_percent", 1,    "%"),
-    102: ("pack_2_voltage", 0.01, "V"),
-    103: ("pack_2_percent", 1,    "%"),
-    106: ("pack_3_voltage", 0.01, "V"),
-    107: ("pack_3_percent", 1,    "%"),
-    110: ("pack_4_voltage", 0.01, "V"),
-    111: ("pack_4_percent", 1,    "%"),
-    114: ("pack_5_voltage", 0.01, "V"),
-    115: ("pack_5_percent", 1,    "%"),
-    118: ("pack_6_voltage", 0.01, "V"),
-    119: ("pack_6_percent", 1,    "%"),
+    # Registers 98 (pack_voltage) and 99 (pack_battery_percent) report data for
+    # whichever pack is currently selected via register 3006 (pack_num selector).
+    # Per-pack data is populated in _connect_and_poll() by iterating packs.
     # Settings (writable + readable for state feedback)
     3001: ("ups_mode",            1,  ""),
     3011: ("grid_charge_on",      1,  "bool"),
@@ -147,13 +141,22 @@ AC500_REGISTERS = {
     3061: ("auto_sleep_mode",     1,  ""),
 }
 
+# Main poll ranges — does NOT include per-pack data (handled separately via pack selector)
 QUERY_RANGES = [
     (10,   40, "main"),
     (70,   21, "details"),
-    (91,   37, "battery_pack"),
+    (91,    9, "battery"),    # regs 91-99: pack_num_max(91), total_battery_voltage(92), pack_num(96)
     (3001, 16, "settings"),
     (3061,  1, "sleep"),
 ]
+
+# Per-pack poll: registers read after selecting each pack via reg 3006.
+# AC500 supports up to 6 B300 packs. Register 96 is the currently-selected pack number
+# (not the total connected count), so we always iterate all slots and filter by voltage.
+PACK_QUERY_START  = 91
+PACK_QUERY_COUNT  = 37   # covers 91-127 (matches warhammerkid reference impl)
+PACK_SWITCH_DELAY = 3    # seconds to wait after writing reg 3006 before reading pack data
+PACK_NUM_MAX      = 6    # AC500 maximum B300 slots
 
 # -- Writable register map (FC=06) ---------------------------------------------
 AC500_WRITABLE = {
@@ -234,14 +237,14 @@ DISCOVERY_ENTITIES = [
          "unique_id": f"bluetti_ac500_pack_{n}_voltage",
          "name": f"AC500 Pack {n} Voltage",
          "state_topic": "{base}/state",
-         "value_template": "{{{{ value_json.pack_{n}_voltage }}}}".replace("{n}", str(n)),
+         "value_template": f"{{{{ value_json.pack_{n}_voltage }}}}",
          "unit_of_measurement": "V", "device_class": "voltage",
          "state_class": "measurement"},
         {"domain": "sensor",
          "unique_id": f"bluetti_ac500_pack_{n}_percent",
          "name": f"AC500 Pack {n} Battery %",
          "state_topic": "{base}/state",
-         "value_template": "{{{{ value_json.pack_{n}_percent }}}}".replace("{n}", str(n)),
+         "value_template": f"{{{{ value_json.pack_{n}_percent }}}}",
          "unit_of_measurement": "%", "device_class": "battery",
          "state_class": "measurement"},
     )],
@@ -431,11 +434,6 @@ def registers_to_state(registers: dict) -> DeviceState:
                 setattr(state, attr, round(raw * scale, 2))
             else:
                 setattr(state, attr, raw)
-    # Null-out packs that report 0 V — not physically connected
-    for n in range(1, 7):
-        if getattr(state, f"pack_{n}_voltage", None) == 0.0:
-            setattr(state, f"pack_{n}_voltage", None)
-            setattr(state, f"pack_{n}_percent", None)
     return state
 
 
@@ -1120,7 +1118,7 @@ class BluettiBLEClient:
                     except stdlib_queue.Empty:
                         break
 
-                # Poll all register pages
+                # Poll all main register pages
                 all_registers = {}
                 for (start_addr, count, label) in QUERY_RANGES:
                     raw_query = build_modbus_query(start_addr, count)
@@ -1133,6 +1131,42 @@ class BluettiBLEClient:
 
                 if all_registers:
                     state = registers_to_state(all_registers)
+
+                    # Per-pack polling: write reg 3006 to select pack, then read 91-127.
+                    # Registers 98 (voltage) and 99 (percent) hold the selected pack's data.
+                    # Always iterate all PACK_NUM_MAX slots — reg 96 is the currently-selected
+                    # pack number, not the connected count; empty slots return 0 V.
+                    for n in range(1, PACK_NUM_MAX + 1):
+                        # Select pack n
+                        sel_cmd = build_modbus_write(3006, n)
+                        to_send = self._crypt.encrypt_data(sel_cmd) if self._crypt else sel_cmd
+                        await self._send_raw(to_send)
+                        await asyncio.sleep(PACK_SWITCH_DELAY)
+
+                        # Read pack registers
+                        pack_resp = await self._send_query(
+                            build_modbus_query(PACK_QUERY_START, PACK_QUERY_COUNT)
+                        )
+                        if pack_resp:
+                            pr = parse_modbus_response(pack_resp, PACK_QUERY_START)
+                            voltage = round(pr[98] * 0.01, 2) if 98 in pr else None
+                            percent = pr.get(99)
+                            # Treat < 5 V as empty slot (noise reads ~3.3 V on disconnected packs)
+                            if voltage is not None and voltage < 5.0:
+                                voltage = None
+                                percent = None
+                            setattr(state, f"pack_{n}_voltage", voltage)
+                            setattr(state, f"pack_{n}_percent", percent)
+                            logger.info("Pack %d: %s V  %s%%", n,
+                                        f"{voltage:.2f}" if voltage else "---", percent or "---")
+
+                    # Override pack_num with the actual count of connected packs
+                    # (reg 96 reflects the last-selected pack, not the connected count)
+                    state.pack_num = sum(
+                        1 for n in range(1, PACK_NUM_MAX + 1)
+                        if getattr(state, f"pack_{n}_voltage", None) is not None
+                    )
+
                     self.mqtt.publish_state(state)
                     if self._status_state:
                         self._status_state.update(state)
@@ -1180,7 +1214,7 @@ def parse_args(cfg: dict):
     status_cfg = cfg.get("status_page", {})
 
     p = argparse.ArgumentParser(
-        description="Bluetti AC500 BLE -> MQTT bridge (v4 - web status page)",
+        description="Bluetti AC500 BLE -> MQTT bridge (v5 - multi-pack B300 support)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--scan",     action="store_true")
