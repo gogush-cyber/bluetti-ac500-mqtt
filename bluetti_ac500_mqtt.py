@@ -120,9 +120,24 @@ AC500_REGISTERS = {
     77: ("ac_input_voltage",       0.1,   "V"),
     80: ("ac_input_frequency",     0.01,  "Hz"),
     92: ("total_battery_voltage",  0.1,   "V"),
-    96: ("pack_num",               1,     ""),
-    98: ("pack_voltage",           0.01,  "V"),
-    99: ("pack_battery_percent",   1,     "%"),
+    96: ("pack_num",               1,     ""),    # number of connected B300 packs
+    # Per-pack data — 4-register blocks starting at 98, one block per pack.
+    # Layout per block: [pack_id, ?, voltage (×0.01 V), percent]
+    # All 6 packs fall within the existing battery_pack query range (91–127).
+    # ⚠ Offsets for packs 2–6 are inferred from the pack-1 pattern;
+    #   verify with diagnose.py against your hardware if values look wrong.
+     98: ("pack_1_voltage", 0.01, "V"),
+     99: ("pack_1_percent", 1,    "%"),
+    102: ("pack_2_voltage", 0.01, "V"),
+    103: ("pack_2_percent", 1,    "%"),
+    106: ("pack_3_voltage", 0.01, "V"),
+    107: ("pack_3_percent", 1,    "%"),
+    110: ("pack_4_voltage", 0.01, "V"),
+    111: ("pack_4_percent", 1,    "%"),
+    114: ("pack_5_voltage", 0.01, "V"),
+    115: ("pack_5_percent", 1,    "%"),
+    118: ("pack_6_voltage", 0.01, "V"),
+    119: ("pack_6_percent", 1,    "%"),
     # Settings (writable + readable for state feedback)
     3001: ("ups_mode",            1,  ""),
     3011: ("grid_charge_on",      1,  "bool"),
@@ -209,20 +224,27 @@ DISCOVERY_ENTITIES = [
      "value_template": "{{ value_json.ac_input_frequency }}",
      "unit_of_measurement": "Hz", "device_class": "frequency", "state_class": "measurement"},
 
-    {"domain": "sensor", "unique_id": "bluetti_ac500_pack_voltage",
-     "name": "AC500 Pack Voltage",
-     "state_topic": "{base}/state", "value_template": "{{ value_json.pack_voltage }}",
-     "unit_of_measurement": "V", "device_class": "voltage", "state_class": "measurement"},
-
-    {"domain": "sensor", "unique_id": "bluetti_ac500_pack_battery_percent",
-     "name": "AC500 Pack Battery Percent",
-     "state_topic": "{base}/state",
-     "value_template": "{{ value_json.pack_battery_percent }}",
-     "unit_of_measurement": "%", "device_class": "battery", "state_class": "measurement"},
-
     {"domain": "sensor", "unique_id": "bluetti_ac500_pack_num",
-     "name": "AC500 Pack Number",
+     "name": "AC500 Pack Count",
      "state_topic": "{base}/state", "value_template": "{{ value_json.pack_num }}"},
+
+    # ── Per-pack sensors (B300 packs 1–6) ─────────────────────────────────────
+    *[entity for n in range(1, 7) for entity in (
+        {"domain": "sensor",
+         "unique_id": f"bluetti_ac500_pack_{n}_voltage",
+         "name": f"AC500 Pack {n} Voltage",
+         "state_topic": "{base}/state",
+         "value_template": "{{{{ value_json.pack_{n}_voltage }}}}".replace("{n}", str(n)),
+         "unit_of_measurement": "V", "device_class": "voltage",
+         "state_class": "measurement"},
+        {"domain": "sensor",
+         "unique_id": f"bluetti_ac500_pack_{n}_percent",
+         "name": f"AC500 Pack {n} Battery %",
+         "state_topic": "{base}/state",
+         "value_template": "{{{{ value_json.pack_{n}_percent }}}}".replace("{n}", str(n)),
+         "unit_of_measurement": "%", "device_class": "battery",
+         "state_class": "measurement"},
+    )],
 
     # ── Switches ──────────────────────────────────────────────────────────────
     {"domain": "switch", "unique_id": "bluetti_ac500_ac_output_sw",
@@ -315,9 +337,19 @@ class DeviceState:
     ac_input_voltage:      Optional[float] = None
     ac_input_frequency:    Optional[float] = None
     total_battery_voltage: Optional[float] = None
-    pack_num:              Optional[int]   = None
-    pack_voltage:          Optional[float] = None
-    pack_battery_percent:  Optional[float] = None
+    pack_num:       Optional[int]   = None    # connected B300 pack count
+    pack_1_voltage: Optional[float] = None
+    pack_1_percent: Optional[int]   = None
+    pack_2_voltage: Optional[float] = None
+    pack_2_percent: Optional[int]   = None
+    pack_3_voltage: Optional[float] = None
+    pack_3_percent: Optional[int]   = None
+    pack_4_voltage: Optional[float] = None
+    pack_4_percent: Optional[int]   = None
+    pack_5_voltage: Optional[float] = None
+    pack_5_percent: Optional[int]   = None
+    pack_6_voltage: Optional[float] = None
+    pack_6_percent: Optional[int]   = None
     ups_mode:              Optional[int]   = None
     grid_charge_on:        Optional[bool]  = None
     time_control_on:       Optional[bool]  = None
@@ -399,6 +431,11 @@ def registers_to_state(registers: dict) -> DeviceState:
                 setattr(state, attr, round(raw * scale, 2))
             else:
                 setattr(state, attr, raw)
+    # Null-out packs that report 0 V — not physically connected
+    for n in range(1, 7):
+        if getattr(state, f"pack_{n}_voltage", None) == 0.0:
+            setattr(state, f"pack_{n}_voltage", None)
+            setattr(state, f"pack_{n}_percent", None)
     return state
 
 
@@ -507,14 +544,44 @@ _STATUS_PAGE_HTML = '''<!DOCTYPE html>
     <div class="card-value" id="v-ac_input_voltage">&#8212;<span class="card-unit">V</span></div></div>
   <div class="card"><div class="card-label">AC Frequency</div>
     <div class="card-value" id="v-ac_input_frequency">&#8212;<span class="card-unit">Hz</span></div></div>
-  <div class="card"><div class="card-label">Pack Voltage</div>
-    <div class="card-value" id="v-pack_voltage">&#8212;<span class="card-unit">V</span></div></div>
-  <div class="card"><div class="card-label">Pack Battery</div>
-    <div class="card-value" id="v-pack_battery_percent">&#8212;<span class="card-unit">%</span></div></div>
-  <div class="card"><div class="card-label">Pack Number</div>
+  <div class="card"><div class="card-label">Packs Connected</div>
     <div class="card-value" id="v-pack_num">&#8212;</div></div>
   <div class="card"><div class="card-label">Power Generation</div>
     <div class="card-value" id="v-power_generation">&#8212;<span class="card-unit">kWh</span></div></div>
+</div>
+
+<h2>Battery Packs</h2>
+<div class="sensor-grid" id="pack-grid">
+  <div class="card pack-card" id="pack-card-1" style="display:none">
+    <div class="card-label">Pack 1</div>
+    <div style="font-size:1.2rem;font-weight:700" id="pack-1-pct">&#8212;<span class="card-unit">%</span></div>
+    <div style="font-size:.85rem;color:var(--muted);margin-top:.2rem" id="pack-1-v">&#8212; V</div>
+  </div>
+  <div class="card pack-card" id="pack-card-2" style="display:none">
+    <div class="card-label">Pack 2</div>
+    <div style="font-size:1.2rem;font-weight:700" id="pack-2-pct">&#8212;<span class="card-unit">%</span></div>
+    <div style="font-size:.85rem;color:var(--muted);margin-top:.2rem" id="pack-2-v">&#8212; V</div>
+  </div>
+  <div class="card pack-card" id="pack-card-3" style="display:none">
+    <div class="card-label">Pack 3</div>
+    <div style="font-size:1.2rem;font-weight:700" id="pack-3-pct">&#8212;<span class="card-unit">%</span></div>
+    <div style="font-size:.85rem;color:var(--muted);margin-top:.2rem" id="pack-3-v">&#8212; V</div>
+  </div>
+  <div class="card pack-card" id="pack-card-4" style="display:none">
+    <div class="card-label">Pack 4</div>
+    <div style="font-size:1.2rem;font-weight:700" id="pack-4-pct">&#8212;<span class="card-unit">%</span></div>
+    <div style="font-size:.85rem;color:var(--muted);margin-top:.2rem" id="pack-4-v">&#8212; V</div>
+  </div>
+  <div class="card pack-card" id="pack-card-5" style="display:none">
+    <div class="card-label">Pack 5</div>
+    <div style="font-size:1.2rem;font-weight:700" id="pack-5-pct">&#8212;<span class="card-unit">%</span></div>
+    <div style="font-size:.85rem;color:var(--muted);margin-top:.2rem" id="pack-5-v">&#8212; V</div>
+  </div>
+  <div class="card pack-card" id="pack-card-6" style="display:none">
+    <div class="card-label">Pack 6</div>
+    <div style="font-size:1.2rem;font-weight:700" id="pack-6-pct">&#8212;<span class="card-unit">%</span></div>
+    <div style="font-size:.85rem;color:var(--muted);margin-top:.2rem" id="pack-6-v">&#8212; V</div>
+  </div>
 </div>
 
 <h2>Controls</h2>
@@ -629,7 +696,7 @@ function updateCards(s) {
   const FIELDS = [
     'ac_output_power','dc_output_power','ac_input_power','dc_input_power',
     'total_battery_percent','total_battery_voltage','ac_input_voltage',
-    'ac_input_frequency','pack_voltage','pack_battery_percent','pack_num','power_generation'
+    'ac_input_frequency','pack_num','power_generation'
   ];
   FIELDS.forEach(f => {
     const el = document.getElementById('v-' + f);
@@ -657,6 +724,23 @@ function updateButtons(s) {
     document.getElementById('num-battery_range_end').value = s.battery_range_end;
 }
 
+function updatePacks(s) {
+  for (let n = 1; n <= 6; n++) {
+    const v   = s['pack_' + n + '_voltage'];
+    const pct = s['pack_' + n + '_percent'];
+    const card = document.getElementById('pack-card-' + n);
+    if (!card) continue;
+    if (v == null || v === 0) {
+      card.style.display = 'none';
+    } else {
+      card.style.display = '';
+      document.getElementById('pack-' + n + '-pct').innerHTML =
+        pct + '<span class="card-unit">%</span>';
+      document.getElementById('pack-' + n + '-v').textContent = v + ' V';
+    }
+  }
+}
+
 function updateChart(history) {
   if (!history || !history.length) return;
   chart.data.datasets[0].data = history.map(h => ({ x: h.ts * 1000, y: h.total_battery_percent }));
@@ -680,6 +764,7 @@ async function refresh() {
     tsEl.className = 'pill' + (data.last_update ? ' ok' : '');
     tsEl.innerHTML = '<span class="dot"></span>' + fmtTime(data.last_update);
     updateCards(_state);
+    updatePacks(_state);
     updateButtons(_state);
     updateChart(data.history);
   } catch (e) {
