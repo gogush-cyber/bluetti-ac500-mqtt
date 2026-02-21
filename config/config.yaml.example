@@ -17,3 +17,10 @@ mqtt:
 
 logging:
   level: "INFO"                   # DEBUG | INFO | WARNING | ERROR
+
+status_page:
+  enabled:  false        # Set true to enable the web dashboard (v4)
+  port:     8273         # HTTP listen port
+  host:     "0.0.0.0"   # Bind address (0.0.0.0 = all interfaces)
+  refresh:  10           # Browser auto-refresh interval in seconds
+  history:  100          # Max chart data points kept in memory

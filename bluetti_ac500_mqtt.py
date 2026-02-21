@@ -61,12 +61,14 @@ MQTT Control Topics
 
 import asyncio
 import argparse
+import collections
 import json
 import logging
 import os
 import queue as stdlib_queue
 import struct
 import sys
+import time
 from dataclasses import dataclass, asdict
 from typing import Optional
 
@@ -74,6 +76,7 @@ import crcmod
 import yaml
 from bleak import BleakClient, BleakScanner
 import paho.mqtt.client as mqtt
+from aiohttp import web
 
 # -- Logging -------------------------------------------------------------------
 _LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bluetti.log")
@@ -323,6 +326,42 @@ class DeviceState:
     auto_sleep_mode:       Optional[int]   = None
 
 
+@dataclass
+class StatusState:
+    device_state:  Optional[DeviceState] = None
+    ble_connected: bool = False
+    mqtt_online:   bool = False
+    last_update:   Optional[float] = None
+    history:       object = None   # collections.deque
+
+    def __post_init__(self):
+        if self.history is None:
+            self.history = collections.deque(maxlen=100)
+
+    def update(self, state: DeviceState):
+        self.device_state  = state
+        self.ble_connected = True
+        self.last_update   = time.time()
+        self.history.append({
+            "ts":                    self.last_update,
+            "total_battery_percent": state.total_battery_percent,
+            "ac_output_power":       state.ac_output_power,
+            "dc_output_power":       state.dc_output_power,
+            "ac_input_power":        state.ac_input_power,
+            "dc_input_power":        state.dc_input_power,
+        })
+
+    def as_api_dict(self) -> dict:
+        from dataclasses import asdict as _asdict
+        return {
+            "state":         _asdict(self.device_state) if self.device_state else {},
+            "ble_connected": self.ble_connected,
+            "mqtt_online":   self.mqtt_online,
+            "last_update":   self.last_update,
+            "history":       list(self.history),
+        }
+
+
 # -- Packet helpers ------------------------------------------------------------
 def build_modbus_query(start_address: int, register_count: int) -> bytes:
     payload = struct.pack(">BBHH", 0x01, 0x03, start_address, register_count)
@@ -374,15 +413,364 @@ def _sub_base(obj, base: str):
     return obj
 
 
+# -- Web status page HTML ------------------------------------------------------
+# Regular string — NOT an f-string. CSS/JS braces are literal.
+# Two tokens replaced at serve time:
+#   {refresh_ms}  → refresh interval in milliseconds
+#   {device_name} → BLE device address
+_STATUS_PAGE_HTML = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Bluetti AC500 &#8212; {device_name}</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg:     #0f1117;
+      --card:   #1a1d27;
+      --border: #2a2d3d;
+      --accent: #4fc3f7;
+      --ok:     #66bb6a;
+      --warn:   #ffa726;
+      --danger: #ef5350;
+      --text:   #e0e0e0;
+      --muted:  #8888a0;
+    }
+    body { background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; padding: 1rem 1.5rem; }
+    h1   { font-size: 1.4rem; font-weight: 600; color: var(--accent); }
+    h2   { font-size: .85rem; font-weight: 600; color: var(--muted); text-transform: uppercase;
+           letter-spacing: .06em; margin: 1.5rem 0 .6rem; }
+    header { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; margin-bottom: 1rem; }
+    .pills  { display: flex; gap: .5rem; flex-wrap: wrap; margin-left: auto; }
+    .pill   { display: inline-flex; align-items: center; gap: .35rem; padding: .25rem .7rem;
+              border-radius: 999px; font-size: .78rem; font-weight: 500;
+              background: var(--card); border: 1px solid var(--border); }
+    .pill .dot        { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+    .pill.ok .dot     { background: var(--ok); }
+    .pill.danger .dot { background: var(--danger); }
+    .sensor-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px,1fr)); gap: .75rem; }
+    .card       { background: var(--card); border: 1px solid var(--border); border-radius: .6rem;
+                  padding: .85rem 1rem; }
+    .card-label { font-size: .72rem; color: var(--muted); text-transform: uppercase;
+                  letter-spacing: .05em; margin-bottom: .3rem; }
+    .card-value { font-size: 1.6rem; font-weight: 700; line-height: 1.1; }
+    .card-unit  { font-size: .75rem; color: var(--muted); margin-left: .2rem; }
+    .controls-row { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; }
+    .btn { padding: .45rem 1.1rem; border-radius: .4rem; border: 1px solid var(--border);
+           background: var(--card); color: var(--text); cursor: pointer; font-size: .85rem;
+           transition: background .15s; }
+    .btn:hover    { background: #252836; }
+    .btn.active   { background: #1a3a22; border-color: var(--ok);     color: var(--ok); }
+    .btn.inactive { background: #3a1a1a; border-color: var(--danger); color: var(--danger); }
+    select, input[type=number] { background: var(--card); color: var(--text);
+      border: 1px solid var(--border); border-radius: .4rem; padding: .4rem .7rem; font-size: .85rem; }
+    input[type=number] { width: 80px; }
+    .set-btn { padding: .4rem .9rem; border-radius: .4rem; border: 1px solid var(--accent);
+               background: transparent; color: var(--accent); cursor: pointer; font-size: .85rem; }
+    .set-btn:hover { background: rgba(79,195,247,.1); }
+    .ctrl-group { display: flex; align-items: center; gap: .4rem; }
+    .ctrl-label { font-size: .78rem; color: var(--muted); min-width: 60px; }
+    .chart-wrap { background: var(--card); border: 1px solid var(--border); border-radius: .6rem;
+                  padding: 1rem; margin-top: .5rem; position: relative; height: 280px; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>&#9889; Bluetti AC500</h1>
+  <span style="color:var(--muted);font-size:.85rem">{device_name}</span>
+  <div class="pills">
+    <span class="pill" id="pill-ble"><span class="dot"></span>BLE</span>
+    <span class="pill" id="pill-mqtt"><span class="dot"></span>MQTT</span>
+    <span class="pill" id="pill-ts"><span class="dot"></span>&#8212;</span>
+  </div>
+</header>
+
+<h2>Sensors</h2>
+<div class="sensor-grid">
+  <div class="card"><div class="card-label">AC Output Power</div>
+    <div class="card-value" id="v-ac_output_power">&#8212;<span class="card-unit">W</span></div></div>
+  <div class="card"><div class="card-label">DC Output Power</div>
+    <div class="card-value" id="v-dc_output_power">&#8212;<span class="card-unit">W</span></div></div>
+  <div class="card"><div class="card-label">AC Input Power</div>
+    <div class="card-value" id="v-ac_input_power">&#8212;<span class="card-unit">W</span></div></div>
+  <div class="card"><div class="card-label">DC Input Power</div>
+    <div class="card-value" id="v-dc_input_power">&#8212;<span class="card-unit">W</span></div></div>
+  <div class="card"><div class="card-label">Battery</div>
+    <div class="card-value" id="v-total_battery_percent">&#8212;<span class="card-unit">%</span></div></div>
+  <div class="card"><div class="card-label">Battery Voltage</div>
+    <div class="card-value" id="v-total_battery_voltage">&#8212;<span class="card-unit">V</span></div></div>
+  <div class="card"><div class="card-label">AC Input Voltage</div>
+    <div class="card-value" id="v-ac_input_voltage">&#8212;<span class="card-unit">V</span></div></div>
+  <div class="card"><div class="card-label">AC Frequency</div>
+    <div class="card-value" id="v-ac_input_frequency">&#8212;<span class="card-unit">Hz</span></div></div>
+  <div class="card"><div class="card-label">Pack Voltage</div>
+    <div class="card-value" id="v-pack_voltage">&#8212;<span class="card-unit">V</span></div></div>
+  <div class="card"><div class="card-label">Pack Battery</div>
+    <div class="card-value" id="v-pack_battery_percent">&#8212;<span class="card-unit">%</span></div></div>
+  <div class="card"><div class="card-label">Pack Number</div>
+    <div class="card-value" id="v-pack_num">&#8212;</div></div>
+  <div class="card"><div class="card-label">Power Generation</div>
+    <div class="card-value" id="v-power_generation">&#8212;<span class="card-unit">kWh</span></div></div>
+</div>
+
+<h2>Controls</h2>
+<div class="controls-row">
+  <button class="btn" id="btn-ac_output_on"    onclick="toggle('ac_output_on',this)">AC Output</button>
+  <button class="btn" id="btn-dc_output_on"    onclick="toggle('dc_output_on',this)">DC Output</button>
+  <button class="btn" id="btn-grid_charge_on"  onclick="toggle('grid_charge_on',this)">Grid Charge</button>
+  <button class="btn" id="btn-time_control_on" onclick="toggle('time_control_on',this)">Time Control</button>
+  <div class="ctrl-group">
+    <span class="ctrl-label">UPS Mode</span>
+    <select id="sel-ups_mode" onchange="sendSet('ups_mode',this.value)">
+      <option value="customized">Customized</option>
+      <option value="pv_priority">PV Priority</option>
+      <option value="standard">Standard</option>
+      <option value="time_control">Time Control</option>
+    </select>
+  </div>
+  <div class="ctrl-group">
+    <span class="ctrl-label">Sleep Mode</span>
+    <select id="sel-auto_sleep_mode" onchange="sendSet('auto_sleep_mode',this.value)">
+      <option value="30s">30 s</option>
+      <option value="1min">1 min</option>
+      <option value="5min">5 min</option>
+      <option value="never">Never</option>
+    </select>
+  </div>
+  <div class="ctrl-group">
+    <span class="ctrl-label">Batt Start</span>
+    <input type="number" id="num-battery_range_start" min="0" max="100" value="20">
+    <button class="set-btn"
+      onclick="sendSet('battery_range_start',document.getElementById('num-battery_range_start').value)">Set</button>
+  </div>
+  <div class="ctrl-group">
+    <span class="ctrl-label">Batt End</span>
+    <input type="number" id="num-battery_range_end" min="0" max="100" value="80">
+    <button class="set-btn"
+      onclick="sendSet('battery_range_end',document.getElementById('num-battery_range_end').value)">Set</button>
+  </div>
+</div>
+
+<h2>History</h2>
+<div class="chart-wrap">
+  <canvas id="histChart"></canvas>
+</div>
+
+<script>
+const REFRESH_MS = {refresh_ms};
+
+// ── Chart setup ──────────────────────────────────────────────────────────────
+const ctx = document.getElementById('histChart').getContext('2d');
+const chart = new Chart(ctx, {
+  type: 'line',
+  data: {
+    datasets: [
+      { label: 'Battery %',  data: [], borderColor: '#66bb6a', backgroundColor: 'transparent',
+        yAxisID: 'pct', tension: 0.3, pointRadius: 2 },
+      { label: 'AC Out (W)', data: [], borderColor: '#4fc3f7', backgroundColor: 'transparent',
+        yAxisID: 'pwr', tension: 0.3, pointRadius: 2 },
+      { label: 'DC Out (W)', data: [], borderColor: '#29b6f6', backgroundColor: 'transparent',
+        yAxisID: 'pwr', tension: 0.3, pointRadius: 2 },
+      { label: 'AC In (W)',  data: [], borderColor: '#ffa726', backgroundColor: 'transparent',
+        yAxisID: 'pwr', tension: 0.3, pointRadius: 2 },
+      { label: 'DC In (W)',  data: [], borderColor: '#ef5350', backgroundColor: 'transparent',
+        yAxisID: 'pwr', tension: 0.3, pointRadius: 2 },
+    ]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: false,
+    interaction: { mode: 'index', intersect: false },
+    scales: {
+      x: {
+        type: 'time',
+        time: { tooltipFormat: 'HH:mm:ss', displayFormats: { second: 'HH:mm:ss', minute: 'HH:mm' } },
+        ticks: { color: '#8888a0' }, grid: { color: '#2a2d3d' }
+      },
+      pct: {
+        position: 'left', min: 0, max: 100,
+        ticks: { color: '#66bb6a' }, grid: { color: '#2a2d3d' },
+        title: { display: true, text: '%', color: '#66bb6a' }
+      },
+      pwr: {
+        position: 'right', min: 0,
+        ticks: { color: '#4fc3f7' }, grid: { drawOnChartArea: false },
+        title: { display: true, text: 'W', color: '#4fc3f7' }
+      }
+    },
+    plugins: {
+      legend: { labels: { color: '#e0e0e0', boxWidth: 14, font: { size: 11 } } }
+    }
+  }
+});
+
+// ── State maps ────────────────────────────────────────────────────────────────
+const UPS_MAP   = { 1: 'customized', 2: 'pv_priority', 3: 'standard', 4: 'time_control' };
+const SLEEP_MAP = { 2: '30s', 3: '1min', 4: '5min', 5: 'never' };
+let _state = {};
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function setPill(id, ok) {
+  const el = document.getElementById(id);
+  el.className = 'pill ' + (ok ? 'ok' : 'danger');
+}
+
+function fmtTime(ts) {
+  if (!ts) return '&#8212;';
+  return new Date(ts * 1000).toLocaleTimeString();
+}
+
+function updateCards(s) {
+  const FIELDS = [
+    'ac_output_power','dc_output_power','ac_input_power','dc_input_power',
+    'total_battery_percent','total_battery_voltage','ac_input_voltage',
+    'ac_input_frequency','pack_voltage','pack_battery_percent','pack_num','power_generation'
+  ];
+  FIELDS.forEach(f => {
+    const el = document.getElementById('v-' + f);
+    if (!el) return;
+    const v = s[f];
+    if (v === undefined || v === null) return;
+    const unit = el.querySelector('.card-unit');
+    el.innerHTML = v + (unit ? unit.outerHTML : '');
+  });
+}
+
+function updateButtons(s) {
+  ['ac_output_on','dc_output_on','grid_charge_on','time_control_on'].forEach(k => {
+    const btn = document.getElementById('btn-' + k);
+    if (!btn || s[k] === undefined || s[k] === null) return;
+    btn.className = 'btn ' + (s[k] ? 'active' : 'inactive');
+  });
+  const ups = UPS_MAP[s.ups_mode];
+  if (ups) document.getElementById('sel-ups_mode').value = ups;
+  const slp = SLEEP_MAP[s.auto_sleep_mode];
+  if (slp) document.getElementById('sel-auto_sleep_mode').value = slp;
+  if (s.battery_range_start != null)
+    document.getElementById('num-battery_range_start').value = s.battery_range_start;
+  if (s.battery_range_end != null)
+    document.getElementById('num-battery_range_end').value = s.battery_range_end;
+}
+
+function updateChart(history) {
+  if (!history || !history.length) return;
+  chart.data.datasets[0].data = history.map(h => ({ x: h.ts * 1000, y: h.total_battery_percent }));
+  chart.data.datasets[1].data = history.map(h => ({ x: h.ts * 1000, y: h.ac_output_power }));
+  chart.data.datasets[2].data = history.map(h => ({ x: h.ts * 1000, y: h.dc_output_power }));
+  chart.data.datasets[3].data = history.map(h => ({ x: h.ts * 1000, y: h.ac_input_power }));
+  chart.data.datasets[4].data = history.map(h => ({ x: h.ts * 1000, y: h.dc_input_power }));
+  chart.update('none');
+}
+
+// ── Polling ───────────────────────────────────────────────────────────────────
+async function refresh() {
+  try {
+    const resp = await fetch('/api/state');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    _state = data.state || {};
+    setPill('pill-ble',  data.ble_connected);
+    setPill('pill-mqtt', data.mqtt_online);
+    const tsEl = document.getElementById('pill-ts');
+    tsEl.className = 'pill' + (data.last_update ? ' ok' : '');
+    tsEl.innerHTML = '<span class="dot"></span>' + fmtTime(data.last_update);
+    updateCards(_state);
+    updateButtons(_state);
+    updateChart(data.history);
+  } catch (e) {
+    setPill('pill-ble', false);
+  }
+}
+
+// ── Control actions ───────────────────────────────────────────────────────────
+async function sendSet(param, value) {
+  try {
+    await fetch('/api/set', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ param, value: String(value) })
+    });
+    setTimeout(refresh, 800);
+  } catch (e) { console.error('sendSet error', e); }
+}
+
+function toggle(param, btn) {
+  sendSet(param, btn.classList.contains('active') ? '0' : '1');
+}
+
+refresh();
+setInterval(refresh, REFRESH_MS);
+</script>
+</body>
+</html>'''
+
+
+# -- Web status HTTP server ----------------------------------------------------
+class StatusServer:
+    def __init__(self, status_state: "StatusState", command_queue: stdlib_queue.Queue,
+                 host: str, port: int, refresh: int, device_name: str):
+        self._status_state  = status_state
+        self._command_queue = command_queue
+        self._host          = host
+        self._port          = port
+        self._refresh       = refresh
+        self._device_name   = device_name
+        self._runner        = None
+
+    async def start(self):
+        app = web.Application()
+        app.router.add_get("/",          self._handle_index)
+        app.router.add_get("/api/state", self._handle_api_state)
+        app.router.add_post("/api/set",  self._handle_api_set)
+        self._runner = web.AppRunner(app)
+        await self._runner.setup()
+        site = web.TCPSite(self._runner, self._host, self._port)
+        await site.start()
+        logger.info("Web status page: http://%s:%d", self._host, self._port)
+
+    async def stop(self):
+        if self._runner:
+            await self._runner.cleanup()
+
+    async def _handle_index(self, request):
+        html = (_STATUS_PAGE_HTML
+                .replace("{refresh_ms}",  str(self._refresh * 1000))
+                .replace("{device_name}", self._device_name))
+        return web.Response(text=html, content_type="text/html")
+
+    async def _handle_api_state(self, request):
+        return web.json_response(self._status_state.as_api_dict())
+
+    async def _handle_api_set(self, request):
+        try:
+            body  = await request.json()
+            param = str(body.get("param", "")).strip()
+            value = str(body.get("value", "")).strip()
+        except Exception:
+            raise web.HTTPBadRequest(reason="Invalid JSON body")
+        if param not in _WRITABLE_BY_NAME:
+            raise web.HTTPBadRequest(reason=f"Unknown parameter: {param}")
+        self._command_queue.put((param, value))
+        logger.info("Web command queued: %s = %s", param, value)
+        return web.json_response({"ok": True, "param": param, "value": value})
+
+
 # -- MQTT publisher ------------------------------------------------------------
 class MQTTPublisher:
     def __init__(self, broker: str, port: int, username: str, password: str,
                  base_topic: str = "bluetti/ac500",
                  command_queue: Optional[stdlib_queue.Queue] = None,
-                 device_address: str = ""):
+                 device_address: str = "",
+                 status_state: Optional["StatusState"] = None):
         self.base_topic       = base_topic
         self._command_queue   = command_queue
         self._device_address  = device_address
+        self._status_state    = status_state
         self.client           = mqtt.Client(client_id="bluetti_ac500_bridge")
 
         if username:
@@ -413,11 +801,15 @@ class MQTTPublisher:
                  3: "Server unavailable", 4: "Bad credentials", 5: "Not authorised"}
         logger.info("MQTT connected: %s", codes.get(rc, f"code {rc}"))
         if rc == 0:
+            if self._status_state:
+                self._status_state.mqtt_online = True
             client.subscribe(f"{self.base_topic}/set/#")
             logger.info("Subscribed to %s/set/#", self.base_topic)
             self.publish_discovery()
 
     def _on_disconnect(self, client, userdata, rc):
+        if self._status_state:
+            self._status_state.mqtt_online = False
         if rc != 0:
             logger.warning("MQTT unexpected disconnect (code %d), will auto-reconnect", rc)
 
@@ -496,10 +888,12 @@ class BluettiBLEClient:
     BLE_LINK_STATUS_CHECK_SN = 3
     BLE_LINK_STATUS_COMPLETE = 4
 
-    def __init__(self, address: str, mqtt_pub: MQTTPublisher, poll_interval: int = 30):
+    def __init__(self, address: str, mqtt_pub: MQTTPublisher, poll_interval: int = 30,
+                 status_state: Optional[StatusState] = None):
         self.address         = address
         self.mqtt            = mqtt_pub
         self.poll_interval   = poll_interval
+        self._status_state   = status_state
         self._command_queue  = stdlib_queue.Queue()
 
         self._response_buf   = bytearray()
@@ -608,6 +1002,8 @@ class BluettiBLEClient:
                 await self._connect_and_poll()
             except Exception as exc:
                 logger.error("BLE error: %s -- retrying in 30s", exc, exc_info=True)
+                if self._status_state:
+                    self._status_state.ble_connected = False
                 await asyncio.sleep(30)
 
     async def _connect_and_poll(self):
@@ -620,6 +1016,8 @@ class BluettiBLEClient:
             self._ble_client  = client
             self._link_status = self.BLE_LINK_STATUS_INIT
             self._auth_event.clear()
+            if self._status_state:
+                self._status_state.ble_connected = True
 
             logger.info("Connected. Subscribing to notifications ...")
             await client.start_notify(NOTIFY_UUID, self._on_notify)
@@ -651,6 +1049,8 @@ class BluettiBLEClient:
                 if all_registers:
                     state = registers_to_state(all_registers)
                     self.mqtt.publish_state(state)
+                    if self._status_state:
+                        self._status_state.update(state)
 
                 await asyncio.sleep(self.poll_interval)
 
@@ -689,12 +1089,13 @@ def load_config() -> dict:
 
 # -- CLI -----------------------------------------------------------------------
 def parse_args(cfg: dict):
-    ble      = cfg.get("ble",     {})
-    mqtt_cfg = cfg.get("mqtt",    {})
-    log      = cfg.get("logging", {})
+    ble        = cfg.get("ble",         {})
+    mqtt_cfg   = cfg.get("mqtt",        {})
+    log        = cfg.get("logging",     {})
+    status_cfg = cfg.get("status_page", {})
 
     p = argparse.ArgumentParser(
-        description="Bluetti AC500 BLE -> MQTT bridge (v3 - auto-discovery)",
+        description="Bluetti AC500 BLE -> MQTT bridge (v4 - web status page)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--scan",     action="store_true")
@@ -707,6 +1108,18 @@ def parse_args(cfg: dict):
     p.add_argument("--interval", type=int, default=ble.get("interval", 30))
     p.add_argument("--debug",    action="store_true",
                    default=(log.get("level", "INFO").upper() == "DEBUG"))
+    # Web status page (v4)
+    p.add_argument("--status-page",    action="store_true",
+                   default=status_cfg.get("enabled", False),
+                   help="Enable web status page")
+    p.add_argument("--status-host",    default=status_cfg.get("host", "0.0.0.0"),
+                   help="Status page bind address")
+    p.add_argument("--status-port",    type=int, default=status_cfg.get("port", 8273),
+                   help="Status page HTTP port")
+    p.add_argument("--status-refresh", type=int, default=status_cfg.get("refresh", 10),
+                   help="Browser auto-refresh interval in seconds")
+    p.add_argument("--status-history", type=int, default=status_cfg.get("history", 100),
+                   help="Max chart data points kept in memory")
     return p.parse_args()
 
 
@@ -728,11 +1141,16 @@ def main():
     if args.interval < 10:
         logger.warning("Polling interval < 10s may cause BLE issues. Using --interval 10+.")
 
+    # Shared live-state object (read by web server, written by BLE + MQTT callbacks)
+    status_state = StatusState()
+    status_state.history = collections.deque(maxlen=args.status_history)
+
     # BLE client owns the command queue
     ble_client = BluettiBLEClient(
         address=args.address,
         mqtt_pub=None,   # set below
         poll_interval=args.interval,
+        status_state=status_state,
     )
 
     # MQTT publisher receives the command queue and device address for discovery
@@ -744,11 +1162,30 @@ def main():
         base_topic=args.topic,
         command_queue=ble_client._command_queue,
         device_address=args.address,
+        status_state=status_state,
     )
     ble_client.mqtt = publisher
 
+    async def _amain():
+        status_server = None
+        if args.status_page:
+            status_server = StatusServer(
+                status_state  = status_state,
+                command_queue = ble_client._command_queue,
+                host          = args.status_host,
+                port          = args.status_port,
+                refresh       = args.status_refresh,
+                device_name   = args.address,
+            )
+            await status_server.start()
+        try:
+            await ble_client.run()
+        finally:
+            if status_server:
+                await status_server.stop()
+
     try:
-        asyncio.run(ble_client.run())
+        asyncio.run(_amain())
     except KeyboardInterrupt:
         logger.info("Interrupted -- shutting down.")
     finally:

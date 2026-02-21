@@ -11,6 +11,9 @@ services:
     network_mode: host
     privileged: true
 
+    # ports:
+    #   - "8273:8273"   # Uncomment if status_page.enabled: true and NOT using host networking
+
     volumes:
       - /opt/bluetti/config:/config:ro   # config file — adjust path to your host
       - /sys/class/bluetooth:/sys/class/bluetooth  # BT sysfs

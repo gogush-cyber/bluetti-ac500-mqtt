@@ -176,6 +176,49 @@ No manual YAML configuration required. On startup the bridge publishes retained 
 
 ---
 
+## Web Status Page (v4)
+
+An optional dark web dashboard that shows live sensor values, connection status, control buttons, and a historical chart — no Home Assistant required.
+
+### Enable
+
+**Via config file** (`config/config.yaml`):
+
+```yaml
+status_page:
+  enabled:  true
+  port:     8273         # HTTP listen port
+  host:     "0.0.0.0"   # Bind address
+  refresh:  10           # Browser auto-refresh in seconds
+  history:  100          # Max chart data points in memory
+```
+
+**Via CLI flag**:
+
+```bash
+python bluetti_ac500_mqtt.py --address AA:BB:CC:DD:EE:FF --broker 192.168.1.100 \
+    --status-page --status-port 8273
+```
+
+Then open `http://<host-ip>:8273` in your browser.
+
+### What it shows
+
+| Section | Content |
+|---------|---------|
+| Status pills | BLE connected, MQTT online, last update time |
+| Sensor grid | 12 live sensor cards (power, battery, voltage, frequency) |
+| Controls | 4 toggle buttons, 2 mode selects, 2 battery-range inputs |
+| History chart | Line chart: battery % + 4 power readings over last N polls |
+
+Control buttons (AC/DC output, Grid Charge, Time Control) write directly to the same BLE command queue used by MQTT — no extra configuration needed.
+
+### Docker note
+
+The compose file uses `network_mode: host` by default (required for Bluetooth), so port 8273 is automatically accessible on the host. If you switch to bridge networking, uncomment the `ports:` entry in `docker-compose.yml`.
+
+---
+
 ## Diagnostics
 
 Use `diagnose.py` to inspect raw register values from the AC500 over BLE:
