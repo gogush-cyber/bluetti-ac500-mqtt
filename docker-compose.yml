@@ -2,7 +2,7 @@ version: "3.8"
 
 services:
   bluetti-mqtt:
-    image: bluetti_ac500_mqtt:v1
+    image: bluetti_ac500_mqtt:v5
     build: .
     container_name: bluetti_ac500_mqtt
     restart: unless-stopped
@@ -15,6 +15,6 @@ services:
     #   - "8273:8273"   # Uncomment if status_page.enabled: true and NOT using host networking
 
     volumes:
-      - /opt/bluetti/config:/config:ro   # config file — adjust path to your host
+      - /data/Dane/Containers/bluetti_mqtt/config:/config:ro   # config file
       - /sys/class/bluetooth:/sys/class/bluetooth  # BT sysfs
       - /dev/bus/usb:/dev/bus/usb                  # USB adapter passthrough
